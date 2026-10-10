@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Moonwalker Booth</title>
+<style>
+:root{--bg:#0b0d1a;--fg:#f2f4ff;--muted:#9aa1c4;--accent:#7fe3d4;--rec:#ff4d6d;--panel:rgba(14,17,36,.74);--line:rgba(255,255,255,.18)}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden}
+[hidden]{display:none!important}
+#app{position:fixed;inset:0;display:grid;place-items:center}
+#stage{position:relative;background:#000;overflow:hidden}
+#stage>*{position:absolute;inset:0;width:100%;height:100%;display:block}
+#stage.mirror #cam,#stage.mirror #bg,#stage.mirror #gl{transform:scaleX(-1)}
+#bg{display:none}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+#start{position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:var(--bg)}
+#start .card{max-width:380px;text-align:left;display:grid;gap:14px}
+#start h1{margin:0;font-size:clamp(34px,9vw,48px);line-height:1;letter-spacing:-.02em}
+#start p{margin:0;color:var(--muted)}
+.btn{min-height:48px;padding:0 20px;border-radius:12px;border:1px solid var(--line);background:var(--panel);font-weight:600}
+.btn.main{background:var(--accent);border-color:var(--accent);color:#06241f}
+.btn:disabled{opacity:.6;cursor:default}
+#toast{position:fixed;top:max(12px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);max-width:min(92vw,420px);padding:10px 14px;border-radius:10px;background:var(--panel);border:1px solid var(--line);text-align:center;font-size:14px}
+#toast[hidden]{display:none}
+#ui{position:fixed;left:0;right:0;bottom:0;padding:10px 16px max(14px,env(safe-area-inset-bottom));display:grid;gap:12px;background:linear-gradient(to top,rgba(11,13,26,.85),rgba(11,13,26,0))}
+#ui[hidden]{display:none}
+#chips{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px;justify-content:center}
+.chip{flex:none;min-height:40px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:var(--panel);font-weight:500}
+.chip[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#06241f}
+#bar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px}
+#bar .side{display:flex}
+#bar .side.end{justify-content:flex-end}
+#shutter{width:72px;height:72px;border-radius:50%;border:4px solid #fff;background:transparent;padding:0;position:relative}
+#shutter::after{content:"";position:absolute;inset:6px;border-radius:50%;background:#fff}
+#shutter:active::after{inset:9px}
+#rec.on{background:var(--rec);border-color:var(--rec);color:#fff}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<div id="app">
+  <div id="stage" class="mirror">
+    <canvas id="cam"></canvas>
+    <canvas id="bg"></canvas>
+    <canvas id="gl"></canvas>
+  </div>
+</div>
+
+<video id="video" playsinline muted autoplay style="position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none"></video>
+
+<div id="start">
+  <div class="card">
+    <h1>Moonwalker Booth</h1>
+    <p>A face-tracked 3D astronaut helmet that follows your head. The camera feed stays on your device.</p>
+    <button class="btn main" id="go" type="button">Start camera</button>
+  </div>
+</div>
+
+<div id="toast" role="status" hidden></div>
+
+<div id="ui" hidden>
+  <div id="chips">
+    <button class="chip" type="button" data-filter="none" aria-pressed="false">None</button>
+    <button class="chip" type="button" data-filter="moonwalker" aria-pressed="true">Moonwalker</button>
+    <button class="chip" type="button" id="bgToggle" aria-pressed="false">Moon background</button>
+    <button class="chip" type="button" id="fmt">Format 9:16</button>
+    <button class="chip" type="button" id="qual">Quality: Lite</button>
+  </div>
+  <div id="bar">
+    <div class="side"><button class="btn" id="flip" type="button">Flip camera</button></div>
+    <button id="shutter" type="button" aria-label="Take photo"></button>
+    <div class="side end"><button class="btn" id="rec" type="button">Record</button></div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { FaceLandmarker, FilesetResolver, ImageSegmenter } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const FACE_MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const SEG_MODEL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+const TAU = Math.PI * 2;
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), stage = $("stage"), cam = $("cam"), bgCv = $("bg"), glCv = $("gl"), toastEl = $("toast");
+const camCtx = cam.getContext("2d");
+const bgCtx = bgCv.getContext("2d");
+const moonCv = document.createElement("canvas");
+const pcCv = document.createElement("canvas"), pcCtx = pcCv.getContext("2d");
+const maskCv = document.createElement("canvas"), maskCtx = maskCv.getContext("2d");
+const recCv = document.createElement("canvas"), recCtx = recCv.getContext("2d");
+let maskImg = null;
+
+const SIZES = { lite: { "9:16": [360, 640], "1:1": [480, 480] }, std: { "9:16": [540, 960], "1:1": [720, 720] } };
+let quality = "lite";
+let FORMATS = SIZES[quality];
+let fmt = "9:16";
+let W = 0, H = 0, facing = "user", filterId = "moonwalker", moonOn = false;
+let stream = null, landmarker = null, fileset = null, segmenter = null, running = false;
+let maskReady = false, personHigh = true, nose = null, segFrame = 0;
+let recording = false, recorder = null, chunks = [], recStart = 0, recTimer = 0, shotPending = false;
+
+let toastTimer = 0;
+function say(msg, ms) {
+  clearTimeout(toastTimer);
+  toastEl.textContent = msg; toastEl.hidden = false;
+  if (ms !== 0) toastTimer = setTimeout(() => { toastEl.hidden = true; }, ms || 3000);
+}
+
+/* ---------------- three.js scene ---------------- */
+const renderer = new THREE.WebGLRenderer({ canvas: glCv, alpha: true, antialias: false, powerPreference: "high-performance" });
+renderer.setPixelRatio(1);
+renderer.setClearColor(0x000000, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(0, 1, 0, -1, 0.1, 4000);
+camera.position.z = 2000;
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+sun.position.set(0.5, 1, 1);
+scene.add(sun);
+
+function makeStarTexture() {
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const x = c.getContext("2d");
+  const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, "rgba(255,248,214,1)"); g.addColorStop(0.25, "rgba(255,248,214,.55)"); g.addColorStop(1, "rgba(255,248,214,0)");
+  x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+  x.fillStyle = "rgba(255,255,240,.95)"; x.beginPath();
+  x.moveTo(32, 2); x.lineTo(36, 28); x.lineTo(62, 32); x.lineTo(36, 36); x.lineTo(32, 62); x.lineTo(28, 36); x.lineTo(2, 32); x.lineTo(28, 28);
+  x.closePath(); x.fill();
+  return new THREE.CanvasTexture(c);
+}
+function makeMoonTexture() {
+  const c = document.createElement("canvas"); c.width = c.height = 128;
+  const x = c.getContext("2d");
+  x.fillStyle = "#f4f0e0"; x.beginPath(); x.arc(64, 64, 46, 0, TAU); x.fill();
+  x.globalCompositeOperation = "destination-out"; x.beginPath(); x.arc(84, 52, 40, 0, TAU); x.fill();
+  return new THREE.CanvasTexture(c);
+}
+
+/* Moonwalker: glass dome, silver collar, wobbling antenna. Units: 1 = distance between the outer eye corners. */
+function buildMoonwalker() {
+  const root = new THREE.Group();
+  const R = 1.7, CY = -0.3, CZ = -0.55, CUT = 2.5;
+
+  const occ = new THREE.MeshBasicMaterial({ colorWrite: false });
+  const head = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 18), occ);
+  head.scale.set(0.82, 1.15, 0.95); head.position.set(0, -0.1, -0.45); head.renderOrder = -10;
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.55, 1.7, 16), occ);
+  neck.position.set(0, -1.6, -0.5); neck.renderOrder = -10;
+  root.add(head, neck);
+
+  const domeMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    uniforms: { uTime: { value: 0 } },
+    vertexShader: `
+      varying vec3 vN;
+      void main(){
+        vN = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform float uTime;
+      varying vec3 vN;
+      void main(){
+        vec3 n = normalize(vN);
+        float rim = pow(1.0 - abs(n.z), 2.2);
+        float t = n.x * 0.85 + n.y * 0.55;
+        float sweep = sin(uTime * 0.7) * 0.35 - 0.1;
+        float streak = smoothstep(0.12, 0.0, abs(t - sweep)) * 0.32;
+        float streak2 = smoothstep(0.05, 0.0, abs(t - sweep - 0.28)) * 0.18;
+        float a = 0.05 + rim * 0.55 + streak + streak2;
+        vec3 col = mix(vec3(0.72, 0.87, 1.0), vec3(1.0), clamp(rim + streak * 2.0, 0.0, 1.0));
+        gl_FragColor = vec4(col, a);
+      }`
+  });
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(R, 48, 32, 0, TAU, 0, CUT), domeMat);
+  dome.position.set(0, CY, CZ); dome.renderOrder = 5;
+  root.add(dome);
+
+  const silver = new THREE.MeshStandardMaterial({ color: 0xb7c1d2, metalness: 0.25, roughness: 0.4 });
+  const rimR = R * Math.sin(CUT), rimY = CY + R * Math.cos(CUT);
+  const collar = new THREE.Mesh(new THREE.TorusGeometry(rimR, 0.11, 16, 48), silver);
+  collar.rotation.x = Math.PI / 2; collar.position.set(0, rimY, CZ);
+  root.add(collar);
+  const teal = new THREE.MeshBasicMaterial({ color: 0x7fe3d4 });
+  [-0.55, 0, 0.55].forEach((a) => {
+    const d = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 10), teal);
+    d.position.set(Math.sin(a) * rimR, rimY, CZ + Math.cos(a) * rimR);
+    root.add(d);
+  });
+
+  const dir = new THREE.Vector3(0.5, 0.38, 0.78).normalize();
+  const moon = new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.55),
+    new THREE.MeshBasicMaterial({ map: makeMoonTexture(), transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+  moon.position.set(0, CY, CZ).addScaledVector(dir, R * 1.004);
+  moon.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+  moon.renderOrder = 6;
+  root.add(moon);
+
+  const ant = new THREE.Group();
+  ant.position.set(0, CY + R, CZ);
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.04, 0.7, 8), silver); stem.position.y = 0.35;
+  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.1, 16, 12), teal); tip.position.y = 0.75;
+  ant.add(stem, tip);
+  root.add(ant);
+
+  scene.add(root);
+  const spring = { ax: 0, az: 0, vx: 0, vz: 0 };
+  return {
+    root,
+    tick(dt, time, omegaPitch, omegaYaw) {
+      domeMat.uniforms.uTime.value = time;
+      const K = 70, D = 5, F = 1.2, s = spring;
+      s.vx += (-K * s.ax - D * s.vx - F * omegaPitch) * dt;
+      s.vz += (-K * s.az - D * s.vz + F * omegaYaw) * dt;
+      s.ax = Math.max(-0.6, Math.min(0.6, s.ax + s.vx * dt));
+      s.az = Math.max(-0.6, Math.min(0.6, s.az + s.vz * dt));
+      ant.rotation.x = s.ax; ant.rotation.z = s.az;
+    }
+  };
+}
+const moonwalker = buildMoonwalker();
+
+/* stardust that drifts up when the mouth opens */
+const MAXP = 100;
+const pPos = new Float32Array(MAXP * 3), pA = new Float32Array(MAXP), pS = new Float32Array(MAXP);
+const pV = new Float32Array(MAXP * 2), pL = new Float32Array(MAXP), pT = new Float32Array(MAXP).fill(1);
+const pGeo = new THREE.BufferGeometry();
+pGeo.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
+pGeo.setAttribute("aAlpha", new THREE.BufferAttribute(pA, 1));
+pGeo.setAttribute("aSize", new THREE.BufferAttribute(pS, 1));
+const pMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: { map: { value: makeStarTexture() } },
+  vertexShader: `
+    attribute float aAlpha; attribute float aSize; varying float vA;
+    void main(){ vA = aAlpha; gl_PointSize = aSize; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D map; varying float vA;
+    void main(){ vec4 t = texture2D(map, gl_PointCoord); gl_FragColor = vec4(t.rgb, t.a * vA); }`
+});
+const points = new THREE.Points(pGeo, pMat);
+points.frustumCulled = false; points.renderOrder = 20;
+scene.add(points);
+let pIdx = 0, emitAcc = 0;
+function emit(x, y, k) {
+  const i = pIdx; pIdx = (pIdx + 1) % MAXP;
+  pL[i] = pT[i] = 1.2 + Math.random();
+  pPos[i * 3] = x + (Math.random() - 0.5) * 40 * k; pPos[i * 3 + 1] = -y; pPos[i * 3 + 2] = 10;
+  pV[i * 2] = (Math.random() - 0.5) * 40 * k; pV[i * 2 + 1] = (70 + Math.random() * 90) * k;
+  pS[i] = (12 + Math.random() * 20) * k;
+}
+function stepParticles(dt, time) {
+  for (let i = 0; i < MAXP; i++) {
+    if (pL[i] > 0) {
+      pL[i] -= dt;
+      pPos[i * 3] += (pV[i * 2] + Math.sin(time * 3 + i) * 12) * dt;
+      pPos[i * 3 + 1] += pV[i * 2 + 1] * dt;
+      pA[i] = pL[i] > 0 ? Math.sin(Math.min(1, pL[i] / pT[i]) * Math.PI) : 0;
+    } else pA[i] = 0;
+  }
+  pGeo.attributes.position.needsUpdate = true;
+  pGeo.attributes.aAlpha.needsUpdate = true;
+  pGeo.attributes.aSize.needsUpdate = true;
+}
+
+/* ---------------- sizing and the moon backdrop ---------------- */
+function fit() {
+  if (!W) return;
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  stage.style.width = W * s + "px"; stage.style.height = H * s + "px";
+}
+addEventListener("resize", fit);
+
+function drawMoon() {
+  moonCv.width = W; moonCv.height = H;
+  const c = moonCv.getContext("2d");
+  const g = c.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#070a1c"); g.addColorStop(0.7, "#1a2150"); g.addColorStop(1, "#252c63");
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
+  let seed = 7; const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  for (let i = 0; i < 110; i++) {
+    c.fillStyle = "rgba(255,255,255," + (0.35 + rnd() * 0.65) + ")";
+    c.beginPath(); c.arc(rnd() * W, rnd() * H * 0.8, 0.5 + rnd() * 1.6, 0, TAU); c.fill();
+  }
+  const m = Math.min(W, H), px = W * 0.2, py = H * 0.17, pr = m * 0.11;
+  c.fillStyle = "#4f8fd6"; c.beginPath(); c.arc(px, py, pr, 0, TAU); c.fill();
+  c.fillStyle = "#6fbf8a";
+  c.beginPath(); c.ellipse(px - pr * 0.3, py - pr * 0.25, pr * 0.35, pr * 0.25, -0.5, 0, TAU); c.fill();
+  c.beginPath(); c.ellipse(px + pr * 0.35, py + pr * 0.3, pr * 0.28, pr * 0.2, 0.6, 0, TAU); c.fill();
+  c.strokeStyle = "rgba(232,241,251,.8)"; c.lineWidth = pr * 0.1; c.lineCap = "round";
+  c.beginPath(); c.moveTo(px - pr * 0.7, py + pr * 0.25); c.quadraticCurveTo(px, py - pr * 0.1, px + pr * 0.7, py - pr * 0.2); c.stroke();
+  c.fillStyle = "#8b91a2"; c.beginPath(); c.moveTo(0, H * 0.8);
+  c.quadraticCurveTo(W * 0.25, H * 0.76, W * 0.5, H * 0.79); c.quadraticCurveTo(W * 0.8, H * 0.83, W, H * 0.77);
+  c.lineTo(W, H); c.lineTo(0, H); c.closePath(); c.fill();
+  c.fillStyle = "#6f7587";
+  [[0.18, 0.9, 0.12, 0.025], [0.78, 0.88, 0.15, 0.03], [0.55, 0.96, 0.09, 0.02]].forEach((e) => {
+    c.beginPath(); c.ellipse(W * e[0], H * e[1], W * e[2], H * e[3], 0, 0, TAU); c.fill();
+  });
+}
+
+function setSize(w, h) {
+  W = w; H = h;
+  cam.width = bgCv.width = pcCv.width = recCv.width = w;
+  cam.height = bgCv.height = pcCv.height = recCv.height = h;
+  renderer.setSize(w, h, false);
+  camera.left = 0; camera.right = w; camera.top = 0; camera.bottom = -h;
+  camera.updateProjectionMatrix();
+  drawMoon(); fit();
+}
+
+/* ---------------- camera and models ---------------- */
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 720 }, height: { ideal: 1280 }, aspectRatio: { ideal: 9 / 16 }, frameRate: { ideal: 30, max: 30 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  if (!video.videoWidth) await new Promise((r) => { video.onloadedmetadata = () => r(); });
+  setSize(FORMATS[fmt][0], FORMATS[fmt][1]);
+  stage.classList.toggle("mirror", facing === "user");
+  maskReady = false; faceT = 0;
+}
+async function initModels() {
+  fileset = await FilesetResolver.forVisionTasks(WASM);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: FACE_MODEL, delegate }, runningMode: "VIDEO", numFaces: 1,
+    outputFaceBlendshapes: false, outputFacialTransformationMatrixes: true
+  });
+  const first = location.search.indexOf("cpu") >= 0 ? "CPU" : "GPU";
+  try { landmarker = await FaceLandmarker.createFromOptions(fileset, opts(first)); }
+  catch (e) { landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+async function ensureSegmenter() {
+  if (segmenter) return;
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: SEG_MODEL, delegate }, runningMode: "VIDEO",
+    outputConfidenceMasks: true, outputCategoryMask: false
+  });
+  try { segmenter = await ImageSegmenter.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { segmenter = await ImageSegmenter.createFromOptions(fileset, opts("CPU")); }
+}
+
+function runSeg(now) {
+  segmenter.segmentForVideo(cam, now, (res) => {
+    const m = res.confidenceMasks && res.confidenceMasks[0];
+    if (!m) return;
+    const mw = m.width, mh = m.height, data = m.getAsFloat32Array();
+    if (maskCv.width !== mw || maskCv.height !== mh || !maskImg) {
+      maskCv.width = mw; maskCv.height = mh; maskImg = maskCtx.createImageData(mw, mh);
+    }
+    if (nose) {
+      const ix = Math.min(mw - 1, Math.max(0, (nose.x * mw) | 0)), iy = Math.min(mh - 1, Math.max(0, (nose.y * mh) | 0));
+      personHigh = data[iy * mw + ix] > 0.5;
+    }
+    const px = maskImg.data;
+    for (let i = 0, j = 3; i < data.length; i++, j += 4) {
+      let p = personHigh ? data[i] : 1 - data[i];
+      p = (p - 0.35) / 0.3; p = p < 0 ? 0 : p > 1 ? 1 : p;
+      px[j] = p * 255;
+    }
+    maskCtx.putImageData(maskImg, 0, 0);
+    maskReady = true;
+  });
+}
+function composeBackground() {
+  if (!moonOn || !maskReady) { bgCv.style.display = "none"; return; }
+  bgCv.style.display = "block";
+  bgCtx.drawImage(moonCv, 0, 0);
+  pcCtx.globalCompositeOperation = "copy"; pcCtx.drawImage(cam, 0, 0, W, H);
+  pcCtx.globalCompositeOperation = "destination-in"; pcCtx.drawImage(maskCv, 0, 0, W, H);
+  pcCtx.globalCompositeOperation = "source-over";
+  bgCtx.drawImage(pcCv, 0, 0);
+}
+
+/* ---------------- pose ---------------- */
+const mat4 = new THREE.Matrix4(), tmpP = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), tmpS = new THREE.Vector3();
+const eul = new THREE.Euler();
+const pose = { x: 0, y: 0, s: 100, q: new THREE.Quaternion(), pitch: 0, yaw: 0, omegaPitch: 0, omegaYaw: 0 };
+let faceT = 0, jawIdx = -1, mouth = { x: 0, y: 0, open: 0 };
+
+function updatePose(res, dt, now) {
+  const lm = res.faceLandmarks[0];
+  const a = lm[33], b = lm[263];
+  const ex = ((a.x + b.x) / 2) * W, ey = ((a.y + b.y) / 2) * H;
+  const eye = Math.hypot((a.x - b.x) * W, (a.y - b.y) * H, (a.z - b.z) * W);
+  const snap = now - faceT > 500;
+  const k = snap ? 1 : 0.6;
+  pose.x += (ex - pose.x) * k; pose.y += (ey - pose.y) * k; pose.s += (eye - pose.s) * (snap ? 1 : 0.35);
+  if (res.facialTransformationMatrixes && res.facialTransformationMatrixes.length) {
+    mat4.fromArray(res.facialTransformationMatrixes[0].data);
+    mat4.decompose(tmpP, tmpQ, tmpS);
+    if (snap) pose.q.copy(tmpQ); else pose.q.slerp(tmpQ, 0.55);
+  }
+  eul.setFromQuaternion(pose.q, "YXZ");
+  if (!snap && dt > 0) {
+    pose.omegaPitch += ((eul.x - pose.pitch) / dt - pose.omegaPitch) * 0.4;
+    pose.omegaYaw += ((eul.y - pose.yaw) / dt - pose.omegaYaw) * 0.4;
+  }
+  pose.pitch = eul.x; pose.yaw = eul.y;
+  nose = lm[1];
+  const m1 = lm[13], m2 = lm[14];
+  mouth.x = ((m1.x + m2.x) / 2) * W; mouth.y = ((m1.y + m2.y) / 2) * H;
+  const gap = Math.abs(m2.y - m1.y) * H / Math.max(eye, 1);
+  mouth.open = Math.max(0, Math.min(1, (gap - 0.05) / 0.2));
+}
+
+/* ---------------- capture ---------------- */
+function drawRec() {
+  recCtx.save();
+  if (facing === "user") { recCtx.translate(W, 0); recCtx.scale(-1, 1); }
+  recCtx.drawImage(moonOn && maskReady ? bgCv : cam, 0, 0, W, H);
+  recCtx.drawImage(glCv, 0, 0, W, H);
+  recCtx.restore();
+}
+async function shareOrSave(blob, name) {
+  const file = new File([blob], name, { type: blob.type });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file] }); return; }
+  } catch (e) { if (e && e.name === "AbortError") return; }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+async function startRec() {
+  const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"]
+    .find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!type) { say("Video recording is not supported in this browser."); return; }
+  const out = recCv.captureStream(30);
+  try {
+    const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mic.getAudioTracks().forEach((t) => out.addTrack(t));
+  } catch (e) { /* silent video if the mic is blocked */ }
+  chunks = [];
+  recorder = new MediaRecorder(out, { mimeType: type, videoBitsPerSecond: 5000000 });
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    out.getTracks().forEach((t) => t.stop());
+    shareOrSave(new Blob(chunks, { type }), "moonwalker." + (type.indexOf("mp4") >= 0 ? "mp4" : "webm"));
+  };
+  recorder.start(250);
+  recording = true; recStart = performance.now();
+  $("rec").classList.add("on");
+  recTimer = setInterval(() => {
+    const s = ((performance.now() - recStart) / 1000) | 0;
+    $("rec").textContent = "Stop " + s + "s";
+  }, 250);
+  $("rec").textContent = "Stop 0s";
+}
+function stopRec() {
+  recording = false; clearInterval(recTimer);
+  $("rec").classList.remove("on"); $("rec").textContent = "Record";
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+function grabFrame() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const a = W / H, sa = vw / vh;
+  let sw = vw, sh = vh, sx = 0, sy = 0;
+  if (sa > a) { sw = vh * a; sx = (vw - sw) / 2; } else { sh = vw / a; sy = (vh - sh) / 2; }
+  camCtx.drawImage(video, sx, sy, sw, sh, 0, 0, W, H);
+}
+
+/* ---------------- main loop ---------------- */
+let lastT = 0, lastVT = -1, started = false, detFrame = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (!running || video.readyState < 2 || !W) return;
+  const dt = Math.min(0.1, (now - lastT) / 1000 || 0.016); lastT = now;
+  if (video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    grabFrame();
+    detFrame++;
+    if (quality === "std" || detFrame % 2 === 0) {
+      const res = landmarker.detectForVideo(cam, now);
+      if (res.faceLandmarks && res.faceLandmarks.length) { updatePose(res, dt, now); faceT = now; }
+    }
+    segFrame++;
+    if (moonOn && segmenter && segFrame % 2 === 0) runSeg(now);
+  }
+  const live = filterId === "moonwalker" && now - faceT < 250;
+  moonwalker.root.visible = live; points.visible = filterId === "moonwalker";
+  if (live) {
+    moonwalker.root.position.set(pose.x, -pose.y, 0);
+    moonwalker.root.quaternion.copy(pose.q);
+    moonwalker.root.scale.setScalar(pose.s);
+    const kk = pose.s / 110;
+    if (mouth.open > 0.3) {
+      emitAcc += mouth.open * 55 * dt;
+      while (emitAcc >= 1) { emit(mouth.x, mouth.y, kk); emitAcc -= 1; }
+    }
+  }
+  moonwalker.tick(dt, now / 1000, pose.omegaPitch, pose.omegaYaw);
+  stepParticles(dt, now / 1000);
+  composeBackground();
+  renderer.render(scene, camera);
+  if (recording || shotPending) {
+    drawRec();
+    if (shotPending) { shotPending = false; recCv.toBlob((b) => { if (b) shareOrSave(b, "moonwalker.png"); }, "image/png"); }
+  }
+}
+
+/* ---------------- UI ---------------- */
+$("go").addEventListener("click", async () => {
+  const go = $("go"); go.disabled = true;
+  try {
+    if (!window.isSecureContext) throw new Error("insecure");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("nocam");
+    say("Starting camera...", 0); await startCamera();
+    say("Loading face tracking...", 0); await initModels();
+  } catch (e) {
+    go.disabled = false;
+    const n = e && e.name, m = e && e.message;
+    if (m === "insecure") say("The camera needs a secure page. Open this over https or from localhost.", 6000);
+    else if (n === "NotAllowedError") say("Camera access was blocked. Allow the camera for this page and try again.", 6000);
+    else if (n === "NotFoundError") say("No camera was found on this device.", 6000);
+    else say("Could not start: " + (m || n || "unknown error"), 6000);
+    return;
+  }
+  $("start").hidden = true; $("ui").hidden = false;
+  running = true; say("Look at the camera. Open your mouth for stardust.", 3500);
+  if (!started) { started = true; requestAnimationFrame(loop); }
+});
+
+document.querySelectorAll("[data-filter]").forEach((b) => b.addEventListener("click", () => {
+  filterId = b.dataset.filter;
+  document.querySelectorAll("[data-filter]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+}));
+$("bgToggle").addEventListener("click", async () => {
+  const btn = $("bgToggle");
+  if (moonOn) { moonOn = false; btn.setAttribute("aria-pressed", "false"); return; }
+  try {
+    if (!segmenter) { say("Loading background model...", 0); await ensureSegmenter(); say("Moon background on.", 1500); }
+    moonOn = true; btn.setAttribute("aria-pressed", "true");
+  } catch (e) { say("The background model could not load.", 4000); }
+});
+$("flip").addEventListener("click", async () => {
+  if (recording) { say("Stop recording before flipping the camera."); return; }
+  facing = facing === "user" ? "environment" : "user";
+  try { await startCamera(); } catch (e) { facing = facing === "user" ? "environment" : "user"; say("That camera is not available."); try { await startCamera(); } catch (_) {} }
+});
+$("fmt").addEventListener("click", () => {
+  if (recording) { say("Stop recording before changing the format."); return; }
+  fmt = fmt === "9:16" ? "1:1" : "9:16";
+  $("fmt").textContent = "Format " + fmt;
+  setSize(FORMATS[fmt][0], FORMATS[fmt][1]);
+  maskReady = false; faceT = 0;
+});
+$("qual").addEventListener("click", () => {
+  if (recording) { say("Stop recording before changing the quality."); return; }
+  quality = quality === "lite" ? "std" : "lite";
+  FORMATS = SIZES[quality];
+  $("qual").textContent = "Quality: " + (quality === "lite" ? "Lite" : "High");
+  setSize(FORMATS[fmt][0], FORMATS[fmt][1]);
+  maskReady = false; faceT = 0;
+});
+$("shutter").addEventListener("click", () => { shotPending = true; });
+$("rec").addEventListener("click", () => { if (recording) stopRec(); else startRec(); });
+</script>
+</body>
+</html>
